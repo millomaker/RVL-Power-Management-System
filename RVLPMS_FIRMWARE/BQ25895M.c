@@ -1,154 +1,221 @@
 /*
- * File:   BQ25895M.c
+ * File:   main.c
  * Author: Gunnar
  *
- * Created on September 14, 2019, 11:18 AM
+ * Created on September 13, 2019, 9:32 PM
  */
 
 #include <xc.h>
 #include <stdint.h>
+#include <pic16f15324.h>
+#include "PICCONFIG.h"
+#include "PWM.h"
+#include "PPS.h"
 #include "I2C.h"
 #include "BQ25895M.h"
-#include "PICCONFIG.h"
+#include "ADC.h"
+#include "LED_INTERFACE.h"
 #include "time.h"
 
-void BQ_Write(unsigned char reg, char data) {
-    I2C_Master_Start();
-    I2C_Master_Write(BQ_ADDR << 1);            
-    I2C_Master_Write(reg);
-    I2C_Master_Write(data);   
-    I2C_Master_Stop();
-}
-
-unsigned short BQ_Read(unsigned char reg) {
-    unsigned char data;
+void PIC_SETUP(){
     
-    I2C_Master_Start();
-    I2C_Master_Write(BQ_ADDR << 1);            
-    I2C_Master_Write(reg);
-    I2C_Master_Start();
-    I2C_Master_Write(0b11010101);   //Address Read      
-    data=I2C_Master_Read(1);
-    I2C_Master_Stop();
-    return data;
+    CPUDOZEbits.IDLEN = 0;      //clear idle mode
+    VREGCON = 0b00000011;       //low power sleep mode
+    
+    //IO setup
+    TRISA = 0xFF;
+    TRISC = 0xFF;
+    ANSELA = 0;
+    ANSELC = 0;
+    ANSELAbits.ANSA4 = 1;   //thermistor
+    WPUA = 0b00100000;      //WPU on RA5 BTN
+    
+    //TIMER1 setup
+    T1CONbits.CKPS = 0b00;  //1:1 prescale
+    T1CONbits.nSYNC = 0;
+    T1CONbits.RD16 = 1;     //16-bit read
+    T1GCONbits.GE = 0;      //Gate OFF
+    T1CLK = 0b00000100;     //CLK is LFINTOSC
+    TMR1 = TMR1_RST;  
+    PIE4bits.TMR1IE = 1;    //enable tmr1 interrupt     
+    T1CONbits.ON = 1;
+    
+    //IOC setup
+    PIE0bits.IOCIE = 1;     //enable IOC module
+    IOCAP = 0b00100000;     //PSEDGE enable bits
+    IOCAN = 0b00100000;     //NEGEDGE enable bits
+    IOCAF = 0x00;
+    
+    INTCONbits.GIE = 1;     //enable active interrupts
+    INTCONbits.PEIE = 1;    //enable peripheral interrupts
 }
 
-uint8_t VBUS_CHRG_STATE[2] = {0, 0};
-uint8_t BATTERY_VOLTAGE;
-uint8_t BQ_adc_state = 0;
-uint32_t BQ_adc_time = 0;
+uint8_t SYS_ENABLE = 0;         //regulator enable state
+uint8_t FiveVolt_ENABLE = 0;    //BengeAdd; 5V regulator state (when SYS_ENABLE is off)
+uint32_t btn_time_start = 0;    //timer for debouncing button
+uint8_t pwr_btn_temp = 0;
+uint8_t pwr_btn_temp_prev = 0;
+uint8_t btn_state = 0;  //0: not pressed 1: being debounced 2: pressed
+uint32_t btn_time_pressed = 0;  //timer for how long button has been held
+uint8_t btn_high_edge = 1;      //goes high when button is released
+uint8_t btn_press_count = 0;    //how many times button has been pressed in short time interval
+uint32_t btn_press_timer = 0;   //timer for determining double press
+uint8_t btn_long_edge = 0;  //goes high when btn is long press, resets when btn is released
 
-void BQ_get_chrg_state() {
-    char temp = BQ_Read(0x0B); //get charge/vbus status
+void interrupt ISR(){   //Benge : Interrupt Service Routine
 
-    VBUS_CHRG_STATE[0] = (temp >> 4) & 0b00000111;   //vbus stat
-    VBUS_CHRG_STATE[1] = (temp >> 2) & 0b00000011;   //chrg stat
+    if(TMR1IF) {    //Benge : Timer 1 Interrupt Flag bit, interrupt when overflow http://ww1.microchip.com/downloads/en/devicedoc/31012a.pdf 
+        TMR1IF = 0;
+        TMR1 = TMR1_RST;
+        timer_counter++;
+    }
+    
+    if(IOCAF5) {
+        IOCAF5 = 0;
+    }
+
+    if(IOCAF1) {    //BengeAdd, If RA1 triggered the interrupt (INT pin on the BQ25895)
+        IOCAF1 = 0;
+    }
+} 
+
+void thermal_protection(){    
+    //calculating setpoint = 255 / [(Therm_resistance(at temp) / 10,000 ) + 1]
+    //For temp = 75C, setpoint = 222
+    if(readADC(ADCRA4) >= 222) {
+        SYS_ENABLE = 0;
+        TRISCbits.TRISC5 = 1;       //turn off regulators
+        TRISAbits.TRISA2 = 1;       //BengeAdd turn off 5V regulator
+        BQ_Write(0x09, 0b01100100); //Force BATFET off 
+    }    
 }
+/*
+void ps2_on() {
+    //turn on ps2
+    __delay_ms(1200);
+    TRISAbits.TRISA2 = 0;   //ps2 reset output
+    aux = 0;                //ps2 reset low
+    __delay_ms(200);
+    TRISAbits.TRISA2 = 1;   //ps2 reset float 
+}
+*/
 
-void BQ_UPDATE() {
-    if(BQ_adc_state == 0) {
-        BQ_get_chrg_state();
-        BQ_Write(0x02, 0b10010001); //start ADC
-        BQ_adc_time = get_time();
-        BQ_adc_state = 1;
-    }
-    else if(BQ_adc_state == 1) {
-        if(timer_diff(BQ_adc_time) >= 80) {
-            BATTERY_VOLTAGE = BQ_Read(0x0E);       
-            BQ_adc_state = 2;
-            BQ_adc_time = get_time();
+void main() {
+            
+    PIC_SETUP();
+    
+    //clear i2c bus if SDA held low
+    I2C_bus_reset();
+    
+    //Initialize I2C Master
+    PPS_unlock();
+    SSP1DATPPS = 0x11;  //SDA INPUT
+    RC1PPS = 0x16;      //SDA OUTPUT
+    SSP1CLKPPS = 0x10;  //SDA INPUT
+    RC0PPS = 0x15;      //SCL OUTPUT
+    PPS_lock();
+    I2C_Master_Init(350000);   
+    
+    BQ_CONFIG_INIT();
+    BQ_INIT();
+    
+    PWM_INIT();
+
+    while(1) {
+
+        CLRWDT();   //Benge : Clear Watchdog Timer
+        
+        //debouncing the power button
+        pwr_btn_temp = pwr_btn;
+        if(pwr_btn_temp ^ pwr_btn_temp_prev) {  //if curr/prev values are not equal, then it is not debounced
+            btn_time_start = get_time();
+            btn_state = 1;
+        }  
+        if(timer_diff(btn_time_start) > 4) {
+            if(!pwr_btn_temp) { //btn is pressed, on first edge, grab the time
+                if(btn_state != 2) btn_time_pressed = get_time();
+                btn_state = 2;      
+            }
+            else {   //btn is not pressed
+                btn_state = 0;
+            }
         }
-    }
-    else if(BQ_adc_state == 2) {
-        if(timer_diff(BQ_adc_time) >= 20) {
-            BQ_adc_state = 0;
+        pwr_btn_temp_prev = pwr_btn_temp;
+             
+        //power_button state machine
+        if(btn_state == 2) {
+            if(timer_diff(btn_time_pressed) > 84 && btn_long_edge == 0) {
+                SYS_ENABLE = !SYS_ENABLE;
+                if(SYS_ENABLE) {
+                    TRISCbits.TRISC5 = 0;           //Benge : this sets the PORTC,5 pin as output; https://www.quora.com/What-is-the-difference-between-PORTCbits-RC7-0-and-TRISCbits-RC7-0-in-PIC18F4550
+                    TRISAbits.TRISA2 = 0;           //BengeAdd; ; Turn ON 5V reg
+                    enable = 1;                     //turn on regulators   
+                    enable5v = 1;                   //BengeAdd
+                }
+                else {
+                    TRISCbits.TRISC5 = 1;           //turn off regulators; Benge : this sets the PORTC,5 pin as input
+                    TRISAbits.TRISA2 = 1;           //BengeAdd; Turn Off 5V reg
+                    if(mode == 3) {                 //shipping mode
+                        BQ_Write(0x09, 0b01100100); //Force BATFET off 
+                    }
+                }
+                btn_long_edge = 1;
+            }
+            btn_high_edge = 0;
         }
-    }
-    else {
-        BQ_adc_state = 0;
+        if(btn_state == 0) {
+            if(btn_high_edge == 0) {
+                if(SYS_ENABLE && timer_diff(btn_time_pressed)<=50){ //short press
+                    if(btn_press_count == 0) btn_press_timer = get_time();
+                    btn_press_count++;
+                    if(btn_press_count == 2) {  //double press
+                        if(!VBUS_CHRG_STATE[1]) mode++; //only increment mode when not charging
+                    }                    
+                }
+            }
+            btn_high_edge = 1;
+            btn_long_edge = 0;
+        }
+        if(timer_diff(btn_press_timer) > 50) btn_press_count = 0;   //reset double press counter
+        
+        BQ_UPDATE();
+        thermal_protection();
+        
+        //WORKING :) ; but the LED doesn't power up after powering up the PMS when charging.
+        //but if I unplug the led power up.
+        if (!SYS_ENABLE) {
+            if (VBUSV_STATE[1]>=0x12 && VBUSV_STATE[1]<=0x1A) { //BengeAdd; If sys not enable & Vbus >= 4.4V & Vbus <= 5.3V (connected to USB on a computer); Don't forget the 2.6V Offset
+                TRISAbits.TRISA2 = 0;
+                enable5v = 1;
+                FiveVolt_ENABLE=!FiveVolt_ENABLE;
+            }
+            else if (FiveVolt_ENABLE && VBUSV_STATE[1]<0x12) { //BengeAdd; If 5V is enable and VBUS < 4.4V
+                TRISAbits.TRISA2 = 1;
+                FiveVolt_ENABLE=!FiveVolt_ENABLE;
+            }
+        }
+        
+        //if battery is low, revert to mode 2 to warn user
+        //.02V/bit, 2.304V offset. bit value = [(desired cutoff voltage) - 2.304] / .02V/bit
+        if(BATTERY_VOLTAGE <= 50) mode = 2;
+        
+        //setting the led interface
+        if(VBUS_CHRG_STATE[1] == 0) {
+            if(SYS_ENABLE) {
+                led_modes();
+            }
+        }
+        else {
+            chrg_led();
+        }
+        
+        //power consumption putting pic to sleep
+        if(!FiveVolt_ENABLE && !SYS_ENABLE && VBUS_CHRG_STATE[1]==0 && btn_state==0 && BQ_adc_state==0) {
+            PWM_power_down();
+            CLRWDT();
+            SLEEP();    
+            RESET();
+        }
+        
     }  
-}
-
-uint8_t REG00_config;
-uint8_t REG01_config;
-uint8_t REG02_config;
-uint8_t REG03_config;
-uint8_t REG04_config;
-uint8_t REG05_config;
-uint8_t REG06_config;
-uint8_t REG07_config;
-uint8_t REG08_config;
-
-//REG00
-uint8_t EN_HIZ = 0;
-uint8_t EN_ILIM = 1;
-uint8_t INILIM = 0b111010;    //3A
-
-//REG01
-uint8_t BHOT = 0b00;
-uint8_t BCOLD = 0b0;
-uint8_t VINDPM_OS = 0b00110;
-
-//REG02
-uint8_t CONV_START = 0b0;
-uint8_t CONV_RATE = 0;
-uint8_t BOOST_FREQ = 1;
-uint8_t ICO_EN = 1;
-uint8_t HVDCP_EN = 0;
-uint8_t MAXC_EN = 0;
-uint8_t FORCE_DPDM = 0;
-uint8_t AUTO_DPDM_EN = 1;
-
-//REG03
-uint8_t WD_RST = 0;
-uint8_t OTG_CONFIG = 0;
-uint8_t CHG_CONFIG = 1;
-uint8_t SYS_MIN = 0b101;
-
-//REG04
-uint8_t ICHG = 0b1100000;  //3.072A
-
-//REG05
-uint8_t IPRECHG = 0b0001;
-uint8_t ITERM = 0b0011;
-
-//REG06
-uint8_t VREG = 0b010110;    //4.192V
-uint8_t BATLOWV = 0;
-uint8_t VRECHG = 0;
-
-//REG07
-uint8_t EN_TERM = 1;
-uint8_t STAT_DIS = 1;  //disable stat pin
-uint8_t WATCHDOG = 0;
-uint8_t EN_TIMER = 1;
-uint8_t CHG_TIMER = 0b10;
-
-//REG08
-uint8_t BAT_COMP = 0;
-uint8_t VCLAMP = 0;
-uint8_t TREG = 0b01;   //80C
-
-void BQ_CONFIG_INIT() {
-    REG00_config = (EN_HIZ<<7)|(EN_ILIM<<6)|(INILIM); 
-    REG01_config = (BHOT<<6)|(BCOLD<<5)|(VINDPM_OS);
-    REG02_config = (CONV_START<<7)|(CONV_RATE<<6)|(BOOST_FREQ<<5)|(ICO_EN<<4)|(HVDCP_EN<<3)|(MAXC_EN<<2)|(FORCE_DPDM<<1)|(AUTO_DPDM_EN);
-    REG03_config = (WD_RST<<6)|(OTG_CONFIG<<5)|(CHG_CONFIG<<4)|(SYS_MIN<<1);   
-    REG04_config = (ICHG);   
-    REG05_config = (IPRECHG<<4)|(ITERM);
-    REG06_config = (VREG<<2)|(BATLOWV<<1)|(VRECHG);
-    REG07_config = (EN_TERM<<7)|(STAT_DIS<<6)|(WATCHDOG<<4)|(EN_TIMER<<3)|(CHG_TIMER<<1)|0b1;    
-    REG08_config = (BAT_COMP<<5)|(VCLAMP<<2)|TREG;  
-}
-
-void BQ_INIT() {
-    BQ_Write(0x00, REG00_config); 
-    BQ_Write(0x01, REG01_config); 
-    BQ_Write(0x02, REG02_config); 
-    BQ_Write(0x03, REG03_config);
-    BQ_Write(0x04, REG04_config);
-    BQ_Write(0x05, REG05_config); 
-    BQ_Write(0x06, REG06_config);
-    BQ_Write(0x07, REG07_config);
-    BQ_Write(0x08, REG08_config);
 }
