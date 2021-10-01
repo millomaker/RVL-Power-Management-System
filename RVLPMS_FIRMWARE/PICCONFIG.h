@@ -53,9 +53,10 @@
 //Pin definitions
 #define pwr_btn     RA5
 #define enable      RC5
-#define aux         RA2    
+//#define aux         RA2    //BengeAdd; comment
 #define thermistor  RA4
-
+#define bqint       RA1 //BengeAdd
+#define enable5v    RA2 //BengeAdd, To Enable 5V Regulator
 //PWM 3 4 5 on RC2, RC3, RC4
 
 #include <xc.h> // include processor files - each processor file is guarded.  
