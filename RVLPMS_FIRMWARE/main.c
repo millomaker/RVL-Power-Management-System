@@ -15,7 +15,6 @@
 #include "BQ25895M.h"
 #include "ADC.h"
 #include "LED_INTERFACE.h"
-#include "stusb4500.h"
 #include "time.h"
 
 void PIC_SETUP(){
@@ -52,6 +51,7 @@ void PIC_SETUP(){
 }
 
 uint8_t SYS_ENABLE = 0;         //regulator enable state
+uint8_t FiveVolt_ENABLE = 0;    //BengeAdd; 5V regulator state (when SYS_ENABLE is off)
 uint32_t btn_time_start = 0;    //timer for debouncing button
 uint8_t pwr_btn_temp = 0;
 uint8_t pwr_btn_temp_prev = 0;
@@ -62,12 +62,9 @@ uint8_t btn_press_count = 0;    //how many times button has been pressed in shor
 uint32_t btn_press_timer = 0;   //timer for determining double press
 uint8_t btn_long_edge = 0;  //goes high when btn is long press, resets when btn is released
 
-uint8_t set_stusb4500 = 0;
-uint32_t stusb4500_timeout = 0;
+void interrupt ISR(){   //Benge : Interrupt Service Routine
 
-void interrupt ISR(){
-
-    if(TMR1IF) {
+    if(TMR1IF) {    //Benge : Timer 1 Interrupt Flag bit, interrupt when overflow http://ww1.microchip.com/downloads/en/devicedoc/31012a.pdf 
         TMR1IF = 0;
         TMR1 = TMR1_RST;
         timer_counter++;
@@ -76,7 +73,10 @@ void interrupt ISR(){
     if(IOCAF5) {
         IOCAF5 = 0;
     }
-    
+
+    if(IOCAF1) {    //BengeAdd, If RA1 triggered the interrupt (INT pin on the BQ25895)
+        IOCAF1 = 0;
+    }
 } 
 
 void thermal_protection(){    
@@ -85,10 +85,11 @@ void thermal_protection(){
     if(readADC(ADCRA4) >= 222) {
         SYS_ENABLE = 0;
         TRISCbits.TRISC5 = 1;       //turn off regulators
+        TRISAbits.TRISA2 = 1;       //BengeAdd turn off 5V regulator
         BQ_Write(0x09, 0b01100100); //Force BATFET off 
     }    
 }
-
+/*
 void ps2_on() {
     //turn on ps2
     __delay_ms(1200);
@@ -97,6 +98,7 @@ void ps2_on() {
     __delay_ms(200);
     TRISAbits.TRISA2 = 1;   //ps2 reset float 
 }
+*/
 
 void main() {
             
@@ -121,7 +123,7 @@ void main() {
 
     while(1) {
 
-        CLRWDT();
+        CLRWDT();   //Benge : Clear Watchdog Timer
         
         //debouncing the power button
         pwr_btn_temp = pwr_btn;
@@ -145,12 +147,14 @@ void main() {
             if(timer_diff(btn_time_pressed) > 84 && btn_long_edge == 0) {
                 SYS_ENABLE = !SYS_ENABLE;
                 if(SYS_ENABLE) {
-                    TRISCbits.TRISC5 = 0;
+                    TRISCbits.TRISC5 = 0;           //Benge : this sets the PORTC,5 pin as output; https://www.quora.com/What-is-the-difference-between-PORTCbits-RC7-0-and-TRISCbits-RC7-0-in-PIC18F4550
+                    TRISAbits.TRISA2 = 0;           //BengeAdd; ; Turn ON 5V reg
                     enable = 1;                     //turn on regulators   
-                    //ps2_on();
+                    enable5v = 1;                   //BengeAdd
                 }
                 else {
-                    TRISCbits.TRISC5 = 1;           //turn off regulators
+                    TRISCbits.TRISC5 = 1;           //turn off regulators; Benge : this sets the PORTC,5 pin as input
+                    TRISAbits.TRISA2 = 1;           //BengeAdd; Turn Off 5V reg
                     if(mode == 3) {                 //shipping mode
                         BQ_Write(0x09, 0b01100100); //Force BATFET off 
                     }
@@ -176,7 +180,21 @@ void main() {
         
         BQ_UPDATE();
         thermal_protection();
-                   
+        
+        //WORKING :) ; but the LED doesn't power up after powering up the PMS when charging.
+        //but if I unplug the led power up.
+        if (!SYS_ENABLE) {
+            if (VBUSV_STATE[1]>=0x12 && VBUSV_STATE[1]<=0x1A) { //BengeAdd; If sys not enable & Vbus >= 4.4V & Vbus <= 5.3V (connected to USB on a computer); Don't forget the 2.6V Offset
+                TRISAbits.TRISA2 = 0;
+                enable5v = 1;
+                FiveVolt_ENABLE=!FiveVolt_ENABLE;
+            }
+            else if (FiveVolt_ENABLE && VBUSV_STATE[1]<0x12) { //BengeAdd; If 5V is enable and VBUS < 4.4V
+                TRISAbits.TRISA2 = 1;
+                FiveVolt_ENABLE=!FiveVolt_ENABLE;
+            }
+        }
+        
         //if battery is low, revert to mode 2 to warn user
         //.02V/bit, 2.304V offset. bit value = [(desired cutoff voltage) - 2.304] / .02V/bit
         if(BATTERY_VOLTAGE <= 50) mode = 2;
@@ -186,21 +204,13 @@ void main() {
             if(SYS_ENABLE) {
                 led_modes();
             }
-            if(timer_diff(stusb4500_timeout) >= 500) {
-                set_stusb4500 = 0;
-            }
         }
         else {
             chrg_led();
-            if(!set_stusb4500) {
-                stusb_negotiate();
-                set_stusb4500 = 1;
-                stusb4500_timeout = get_time();           
-            }
         }
         
         //power consumption putting pic to sleep
-        if(!SYS_ENABLE && VBUS_CHRG_STATE[1]==0 && btn_state==0 && BQ_adc_state==0 && !set_stusb4500) {
+        if(!FiveVolt_ENABLE && !SYS_ENABLE && VBUS_CHRG_STATE[1]==0 && btn_state==0 && BQ_adc_state==0) {
             PWM_power_down();
             CLRWDT();
             SLEEP();    
